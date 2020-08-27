@@ -1,0 +1,752 @@
+-- First, we calculate the score for the minimum values
+-- because ph/pco2 rules are an interaction *within* a blood gas, we calculate them here
+-- the worse score is then taken for the final calculation
+
+DROP MATERIALIZED VIEW IF EXISTS APSII CASCADE;
+CREATE MATERIALIZED VIEW APSII as
+with bg as
+(
+  -- join blood gas to ventilation durations to determine if patient was vent
+  -- also join to cpap table for the same purpose
+  select bg.icustay_id, bg.charttime
+  , PO2 as PaO2
+  , AADO2
+  -- row number indicating the highest AaDO2
+  , case
+      when  coalesce(FIO2, fio2_chartevents) is not null
+        and coalesce(FIO2, fio2_chartevents) >= 50
+          then ROW_NUMBER() over (partition by bg.ICUSTAY_ID ORDER BY AADO2 DESC)
+      else null
+      end as aado2_rn
+  , case
+      when  coalesce(FIO2, fio2_chartevents) is not null
+        and coalesce(FIO2, fio2_chartevents) >= 50
+          then null
+      else ROW_NUMBER() over (partition by bg.ICUSTAY_ID ORDER BY PO2 DESC)
+    end as pao2_rn
+
+  from bloodgasfirstdayarterial bg
+)
+, hco3_max as
+(
+  select labs.icustay_id,bicarbonate_max as hco3
+    -- 碳酸盐
+    , case
+        when labs.bicarbonate_max <  15.0 then 4
+        when labs.bicarbonate_max <  18.0 then 3
+        when labs.bicarbonate_max <  22.0 then 2
+        when labs.bicarbonate_max <  32.0 then 0
+        when labs.bicarbonate_max <  41.0 then 1
+        when labs.bicarbonate_max <  52.0 then 3
+        when labs.bicarbonate_max >= 52.0 then 4
+      end as  hco3_score
+
+    from labsfirstday labs
+    where bicarbonate_max is not null
+)
+
+, hco3_min as
+(
+  select labs.icustay_id,bicarbonate_min as hco3
+    -- 碳酸盐
+    , case
+        when labs.bicarbonate_min <  15.0 then 4
+        when labs.bicarbonate_min <  18.0 then 3
+        when labs.bicarbonate_min <  22.0 then 2
+        when labs.bicarbonate_min <  32.0 then 0
+        when labs.bicarbonate_min <  41.0 then 1
+        when labs.bicarbonate_min <  52.0 then 3
+        when labs.bicarbonate_min >= 52.0 then 4
+      end as  hco3_score
+
+    from labsfirstday labs
+    where bicarbonate_min is not null
+)
+
+, acidbase as
+(
+  select labs.icustay_id
+  , ph
+  , case
+    when ph is null then
+      case
+          when smax.hco3_score >=  smin.hco3_score
+            then smax.hco3_score
+          when smax.hco3_score <  smin.hco3_score
+            then smin.hco3_score
+      end
+    when ph < 7.15 then 4
+    when ph < 7.25 then 3
+    when ph < 7.33 then 2
+    when ph < 7.50 then 0
+    when ph < 7.60 then 1
+    when ph < 7.70 then 3
+    when ph >=7.70 then 4
+  end as acidbase_score
+  , case
+     when ph is null and smax.hco3_score >=  smin.hco3_score
+      then smax.hco3
+     when  ph is null and smax.hco3_score <  smin.hco3_score
+      then smin.hco3
+    else null
+  end as hco3
+  from labsfirstday labs
+  left join bloodgasfirstdayarterial bg
+    on labs.icustay_id=bg.icustay_id
+  left join hco3_min smin
+    on labs.icustay_id = smin.icustay_id
+  left join hco3_max smax
+    on labs.icustay_id = smax.icustay_id
+)
+, acidbase_max as
+(
+  select icustay_id, acidbase_score, ph, hco3
+    -- create integer which indexes maximum value of score with 1
+  , case
+      when ph is not null or hco3 is not null
+        then ROW_NUMBER() over (partition by ICUSTAY_ID ORDER BY ACIDBASE_SCORE DESC)
+      else null
+    end as acidbase_rn
+  from acidbase
+)
+
+-- define acute renal failure (ARF) as:
+--  creatinine >=1.5 mg/dl
+--  and urine output <410 cc/day
+--  and no chronic dialysis
+, arf as
+(
+  select ie.icustay_id
+    , case
+        when labs.creatinine_max >= 1.5
+        and  uo.urineoutput < 410
+        -- acute renal failure is only coded if the patient is not on chronic dialysis
+        -- we use ICD-9 coding of ESRD as a proxy for chronic dialysis
+        and  icd.ckd = 0
+          then 1
+      else 0 end as arf
+  from icustays ie
+  left join uofirstday uo
+    on ie.icustay_id = uo.icustay_id
+  left join labsfirstday labs
+    on ie.icustay_id = labs.icustay_id
+  left join
+  (
+    select hadm_id
+      , max(case
+          -- severe kidney failure requiring use of dialysis
+          when icd9_code in  ('5854','5855','5856') then 1
+          -- we do not include 5859 as that is sometimes coded for acute-on-chronic ARF
+        else 0 end)
+      as ckd
+    from diagnoses_icd
+    group by hadm_id
+  ) icd
+    on ie.hadm_id = icd.hadm_id
+)
+, cohort as
+(
+select ie.subject_id, ie.hadm_id, ie.icustay_id
+      , ie.intime
+      -- , ie.outtime
+      , adm.dischtime
+      , pat.dod
+
+      , vital.tempc_min
+      , vital.tempc_max
+      , vital.meanbp_min
+      , vital.meanbp_max
+      , vital.heartrate_min
+      , vital.heartrate_max
+      , vital.resprate_min
+      , vital.resprate_max
+
+      , labs.hematocrit_min
+      , labs.hematocrit_max
+      , labs.wbc_min
+      , labs.wbc_max
+      , labs.creatinine_min
+      , labs.creatinine_max
+      , labs.sodium_min
+      , labs.sodium_max
+      , labs.potassium_min
+      , labs.potassium_max
+
+      , labs.bicarbonate_min
+      , labs.bicarbonate_max
+      , pa.PaO2
+      , aa.AaDO2
+
+      , ab.ph
+      , ab.hco3
+      , ab.acidbase_score
+
+      -- , labs.bun_min
+      -- , labs.bun_max
+      -- , labs.albumin_min
+      -- , labs.albumin_max
+      -- , labs.bilirubin_min
+      -- , labs.bilirubin_max
+
+      , case
+          when labs.glucose_max is null and vital.glucose_max is null
+            then null
+          when labs.glucose_max is null or vital.glucose_max > labs.glucose_max
+            then vital.glucose_max
+          when vital.glucose_max is null or labs.glucose_max > vital.glucose_max
+            then labs.glucose_max
+          else labs.glucose_max -- if equal, just pick labs
+        end as glucose_max
+
+      , case
+          when labs.glucose_min is null and vital.glucose_min is null
+            then null
+          when labs.glucose_min is null or vital.glucose_min < labs.glucose_min
+            then vital.glucose_min
+          when vital.glucose_min is null or labs.glucose_min < vital.glucose_min
+            then labs.glucose_min
+          else labs.glucose_min -- if equal, just pick labs
+        end as glucose_min
+
+
+      , vent.vent
+      , uo.urineoutput
+      -- gcs and its components
+      , gcs.mingcs
+      , gcs.gcsmotor, gcs.gcsverbal,  gcs.gcseyes, gcs.endotrachflag
+      -- acute renal failure
+      , arf.arf as arf
+
+from icustays ie
+inner join admissions adm
+  on ie.hadm_id = adm.hadm_id
+inner join patients pat
+  on ie.subject_id = pat.subject_id
+
+-- join to above views - the row number filters to 1 row per ICUSTAY_ID
+left join bg pa
+  on  ie.icustay_id = pa.icustay_id
+  and pa.pao2_rn = 1
+left join bg aa
+  on  ie.icustay_id = aa.icustay_id
+  and aa.aado2_rn = 1
+left join acidbase_max ab
+  on  ie.icustay_id = ab.icustay_id
+  and ab.acidbase_rn = 1
+left join arf
+  on ie.icustay_id = arf.icustay_id
+
+-- join to custom tables to get more data....
+left join ventfirstday vent
+  on ie.icustay_id = vent.icustay_id
+left join gcsfirstday gcs
+  on ie.icustay_id = gcs.icustay_id
+left join vitalsfirstday vital
+  on ie.icustay_id = vital.icustay_id
+left join uofirstday uo
+  on ie.icustay_id = uo.icustay_id
+left join labsfirstday labs
+  on ie.icustay_id = labs.icustay_id
+)
+-- First, we calculate the score for the minimum values
+, score_min as
+(
+  select cohort.subject_id, cohort.hadm_id, cohort.icustay_id
+     , case
+        when tempc_min is null then null
+        when tempc_min <  30.0 then 4
+        when tempc_min <  32.0 then 3
+        when tempc_min <  34.0 then 2
+        when tempc_min <  36.0 then 1
+        when tempc_min <  38.5 then 0
+        when tempc_min <  39.0 then 1
+        when tempc_min <  41.0 then 3
+        when tempc_min >= 41.0 then 4
+      end as temp_score
+    , tempc_min as tempc
+    
+    , case
+        when meanbp_min is null then null
+        when meanbp_min <   50 then 4
+        when meanbp_min <   70 then 2
+        when meanbp_min <  110 then 0
+        when meanbp_min <  130 then 2
+        when meanbp_min <  160 then 3
+        when meanbp_min >= 160 then 4
+      end as meanbp_score
+    , meanbp_min as meanbp
+
+    , case
+        when heartrate_min is null then null
+        when heartrate_min <   40 then 4
+        when heartrate_min <   55 then 3
+        when heartrate_min <   70 then 2
+        when heartrate_min <  110 then 0
+        when heartrate_min <  140 then 2
+        when heartrate_min <  180 then 3
+        when heartrate_min >= 180 then 4
+      end as hr_score
+    , heartrate_min as heartrate
+
+    -- 呼吸频率
+    , case
+        when resprate_min is null then null
+        when resprate_min <   6 then 4
+        when resprate_min <  10 then 2
+        when resprate_min <  12 then 1
+        when resprate_min <  25 then 0
+        when resprate_min <  35 then 1
+        when resprate_min <  50 then 3
+        when resprate_min >= 50 then 4
+      end as resprate_score
+    , resprate_min as resprate
+
+    -- 钠
+    , case
+        when sodium_min is null then null
+        when sodium_min <= 110 then 4
+        when sodium_min <  120 then 3
+        when sodium_min <  130 then 2
+        when sodium_min <  150 then 0
+        when sodium_min <  155 then 1
+        when sodium_min <  160 then 2
+        when sodium_min <  180 then 3
+        when sodium_min >= 180 then 4
+      end as sodium_score
+    , sodium_min as sodium
+
+    -- 钾
+    -- 自定义
+    , case
+        when potassium_min is null then null
+        when potassium_min <  2.5 then 4
+        when potassium_min <  3.0 then 2
+        when potassium_min <  3.5 then 1
+        when potassium_min <  5.5 then 0
+        when potassium_min <  6.0 then 1
+        when potassium_min <  7.0 then 3
+        when potassium_min >= 7.0 then 4
+      end as potassium_score
+    , potassium_min as potassium
+
+    -- 肌酐 mg/dL
+    -- 每日肌酐升高量>=1.5 尿量<410
+    , case
+        when creatinine_min is null then null
+        when arf = 1
+            then case
+                when creatinine_min <   0.6 then 4
+                when creatinine_min <   1.5 then 0
+                when creatinine_min <   2.0 then 4
+                when creatinine_min <   3.5 then 6
+                when creatinine_min >=  3.5 then 8
+            end
+        when arf = 0
+            then case
+                when creatinine_min <   0.6 then 2
+                when creatinine_min <   1.5 then 0
+                when creatinine_min <   2.0 then 2
+                when creatinine_min <   3.5 then 3
+                when creatinine_min >=  3.5 then 4
+            end
+    end as creatinine_score
+    , creatinine_min as creatinine
+
+    -- 血细胞比容
+    , case
+        when hematocrit_min is null then null
+        when hematocrit_min <   20.0 then 4
+        when hematocrit_min <   30.0 then 2
+        when hematocrit_min <   46.0 then 0
+        when hematocrit_min <   50.0 then 1
+        when hematocrit_min <   60.0 then 2
+        when hematocrit_min >=  60.0 then 4
+      end as hematocrit_score
+    , hematocrit_min as hematocrit
+
+
+    , case
+        when wbc_min is null then null
+        when wbc_min <   1.0 then 4
+        when wbc_min <   3.0 then 2
+        when wbc_min <  15.0 then 0
+        when wbc_min <  20.0 then 1
+        when wbc_min <  40.0 then 2
+        when wbc_min >= 40.0 then 4
+      end as wbc_score
+    , wbc_min as wbc
+
+from cohort
+)
+-- Then, we calculate the score for the maximum values
+, score_max as
+(
+  select cohort.subject_id, cohort.hadm_id, cohort.icustay_id
+     , case
+        when tempc_max is null then null
+        when tempc_max <  30.0 then 4
+        when tempc_max <  32.0 then 3
+        when tempc_max <  34.0 then 2
+        when tempc_max <  36.0 then 1
+        when tempc_max <  38.5 then 0
+        when tempc_max <  39.0 then 1
+        when tempc_max <  41.0 then 3
+        when tempc_max >= 41.0 then 4
+      end as temp_score
+    , tempc_max as tempc
+    
+    , case
+        when meanbp_max is null then null
+        when meanbp_max <   50 then 4
+        when meanbp_max <   70 then 2
+        when meanbp_max <  110 then 0
+        when meanbp_max <  130 then 2
+        when meanbp_max <  160 then 3
+        when meanbp_max >= 160 then 4
+      end as meanbp_score
+    , meanbp_max as meanbp
+
+    , case
+        when heartrate_max is null then null
+        when heartrate_max <   40 then 4
+        when heartrate_max <   55 then 3
+        when heartrate_max <   70 then 2
+        when heartrate_max <  110 then 0
+        when heartrate_max <  140 then 2
+        when heartrate_max <  180 then 3
+        when heartrate_max >= 180 then 4
+      end as hr_score
+    , heartrate_max as heartrate
+
+    -- 呼吸频率
+    , case
+        when resprate_max is null then null
+        when resprate_max <   6 then 4
+        when resprate_max <  10 then 2
+        when resprate_max <  12 then 1
+        when resprate_max <  25 then 0
+        when resprate_max <  35 then 1
+        when resprate_max <  50 then 3
+        when resprate_max >= 50 then 4
+      end as resprate_score
+    , resprate_max as resprate
+
+    -- 钠
+    , case
+        when sodium_max is null then null
+        when sodium_max <= 110 then 4
+        when sodium_max <  120 then 3
+        when sodium_max <  130 then 2
+        when sodium_max <  150 then 0
+        when sodium_max <  155 then 1
+        when sodium_max <  160 then 2
+        when sodium_max <  180 then 3
+        when sodium_max >= 180 then 4
+      end as sodium_score
+    , sodium_max as sodium
+
+    -- 钾
+    -- 自定义
+    , case
+        when potassium_max is null then null
+        when potassium_max <  2.5 then 4
+        when potassium_max <  3.0 then 2
+        when potassium_max <  3.5 then 1
+        when potassium_max <  5.5 then 0
+        when potassium_max <  6.0 then 1
+        when potassium_max <  7.0 then 3
+        when potassium_max >= 7.0 then 4
+      end as potassium_score
+    , potassium_max as potassium
+
+    -- 肌酐 mg/dL
+    -- 每日肌酐升高量>=1.5 尿量<410
+    , case
+        when creatinine_max is null then null
+        when arf = 1
+            then case
+                when creatinine_max <   0.6 then 4
+                when creatinine_max <   1.5 then 0
+                when creatinine_max <   2.0 then 4
+                when creatinine_max <   3.5 then 6
+                when creatinine_max >=  3.5 then 8
+            end
+        when arf = 0
+            then case
+                when creatinine_max <   0.6 then 2
+                when creatinine_max <   1.5 then 0
+                when creatinine_max <   2.0 then 2
+                when creatinine_max <   3.5 then 3
+                when creatinine_max >=  3.5 then 4
+            end
+    end as creatinine_score
+    , creatinine_max as creatinine
+
+    -- 血细胞比容
+    , case
+        when hematocrit_max is null then null
+        when hematocrit_max <   20.0 then 4
+        when hematocrit_max <   30.0 then 2
+        when hematocrit_max <   46.0 then 0
+        when hematocrit_max <   50.0 then 1
+        when hematocrit_max <   60.0 then 2
+        when hematocrit_max >=  60.0 then 4
+      end as hematocrit_score
+    , hematocrit_max as hematocrit
+
+
+    , case
+        when wbc_max is null then null
+        when wbc_max <   1.0 then 4
+        when wbc_max <   3.0 then 2
+        when wbc_max <  15.0 then 0
+        when wbc_max <  20.0 then 1
+        when wbc_max <  40.0 then 2
+        when wbc_max >= 40.0 then 4
+      end as wbc_score
+    , wbc_max as wbc
+
+from cohort
+)
+
+, scorecomp as
+(
+    select co.*
+    , case
+      when dod <= dischtime then 1
+      else 0
+    end as dod_flag
+
+    , case
+      when tempc_max is null then null
+      when smax.temp_score >= smin.temp_score
+        then smax.temp_score
+      when smax.temp_score < smin.temp_score
+        then smin.temp_score
+      end as temp_score
+
+    , case
+      when smax.temp_score >= smin.temp_score
+        then smax.tempc
+      when smax.temp_score < smin.temp_score
+        then smin.tempc
+      end as tempc
+
+    , case
+      when meanbp_max is null then null
+      when smax.meanbp_score >= smin.meanbp_score
+        then smax.meanbp_score
+      when smax.meanbp_score < smin.meanbp_score
+        then smin.meanbp_score
+      end as meanbp_score
+
+    , case
+      when smax.meanbp_score >= smin.meanbp_score
+        then smax.meanbp
+      when smax.meanbp_score < smin.meanbp_score
+        then smin.meanbp
+      end as meanbp
+
+    , case
+      when heartrate_max is null then null
+      when smax.hr_score >= smin.hr_score
+        then smax.hr_score
+      when smax.hr_score < smin.hr_score
+        then smin.hr_score
+      end as hr_score
+
+    , case
+      when smax.hr_score >= smin.hr_score
+        then smax.heartrate
+      when smax.hr_score < smin.hr_score
+        then smin.heartrate
+      end as heartrate
+
+    , case
+      when resprate_max is null then null
+      when smax.resprate_score >= smin.resprate_score
+        then smax.resprate_score
+      when smax.resprate_score < smin.resprate_score
+        then smin.resprate_score
+      end as resprate_score
+
+    , case
+      when smax.resprate_score >= smin.resprate_score
+        then smax.resprate
+      when smax.resprate_score < smin.resprate_score
+        then smin.resprate
+      end as resprate
+
+    , case
+      when PaO2 is null and AaDO2 is null
+        then null
+      when PaO2 is not null then
+        case
+          when PaO2 < 55 then 4
+          when PaO2 <= 60 then 3
+          when PaO2 <= 70 then 1
+          when PaO2 > 70 then 0
+        else 0 end
+      when AaDO2 is not null then
+        case
+          when AaDO2 <  200 then 0
+          when AaDO2 <  350 then 2
+          when AaDO2 <  500 then 3
+          when AaDO2 >= 500 then 4
+        else 0 end
+      end as pao2_aado2_score
+
+    , case
+      when sodium_max is null then null
+      when smax.sodium_score >= smin.sodium_score
+        then smax.sodium_score
+      when smax.sodium_score < smin.sodium_score
+        then smin.sodium_score
+      end as sodium_score
+
+    , case
+      when smax.sodium_score >= smin.sodium_score
+        then smax.sodium
+      when smax.sodium_score < smin.sodium_score
+        then smin.sodium
+      end as sodium
+
+    , case
+      when potassium_max is null then null
+      when smax.potassium_score >= smin.potassium_score
+        then smax.potassium_score
+      when smax.potassium_score < smin.potassium_score
+        then smin.potassium_score
+      end as potassium_score
+
+    , case
+      when smax.potassium_score >= smin.potassium_score
+        then smax.potassium
+      when smax.potassium_score < smin.potassium_score
+        then smin.potassium
+      end as potassium
+
+    , case
+      when creatinine_max is null then null
+      when smax.creatinine_score >= smin.creatinine_score
+        then smax.creatinine_score
+      when smax.creatinine_score < smin.creatinine_score
+        then smin.creatinine_score
+      end as creatinine_score
+
+    , case
+      when smax.creatinine_score >= smin.creatinine_score
+        then smax.creatinine
+      when smax.creatinine_score < smin.creatinine_score
+        then smin.creatinine
+      end as creatinine
+
+    , case
+      when hematocrit_max is null then null
+      when smax.hematocrit_score >= smin.hematocrit_score
+        then smax.hematocrit_score
+      when smax.hematocrit_score < smin.hematocrit_score
+        then smin.hematocrit_score
+      end as hematocrit_score
+
+    , case
+      when smax.hematocrit_score >= smin.hematocrit_score
+        then smax.hematocrit
+      when smax.hematocrit_score < smin.hematocrit_score
+        then smin.hematocrit
+      end as hematocrit
+
+    , case
+      when wbc_max is null then null
+      when smax.wbc_score >= smin.wbc_score
+        then smax.wbc_score
+      when smax.wbc_score < smin.wbc_score
+        then smin.wbc_score
+      end as wbc_score
+
+    , case
+      when smax.wbc_score >= smin.wbc_score
+        then smax.wbc
+      when smax.wbc_score < smin.wbc_score
+        then smin.wbc
+      end as wbc
+
+  -- For some labs, "furthest from normal" doesn't make sense
+  -- e.g. creatinine w/ ARF, the minimum could be 0.3, and the max 1.6
+  -- while the minimum of 0.3 is "further from 1", seems like the max should be scored
+
+    , case
+      when mingcs is not null
+        then mingcs
+      when mingcs is null and endotrachflag = 1
+        -- here they are intubated, so their verbal score is inappropriate
+        -- normally you are supposed to use "clinical judgement"
+        -- we don't have that, so we just assume normal (as was done in the original study)
+        then 15
+      else 15-gcseyes-gcsmotor-gcsverbal
+    end as gcs_score
+
+
+from cohort co
+left join score_min smin
+  on co.icustay_id = smin.icustay_id
+left join score_max smax
+  on co.icustay_id = smax.icustay_id
+)
+
+, score as
+(
+  select s.*
+  -- coalesce statements impute normal score of zero if data element is missing
+  , coalesce(temp_score,0)
+  + coalesce(meanbp_score,0)
+  + coalesce(hr_score,0)
+  + coalesce(resprate_score,0)
+  + coalesce(pao2_aado2_score,0)
+  + coalesce(acidbase_score,0)
+  + coalesce(sodium_score,0)
+  + coalesce(potassium_score,0)
+  + coalesce(creatinine_score,0)
+  + coalesce(hematocrit_score,0)
+  + coalesce(wbc_score,0)
+  + coalesce(gcs_score,0)
+    as APSII
+  from scorecomp s
+)
+select ie.subject_id, ie.hadm_id, ie.icustay_id
+, APSII
+, dod_flag
+, dod
+, dischtime
+, temp_score
+, meanbp_score
+, hr_score
+, resprate_score
+, pao2_aado2_score
+, acidbase_score
+, sodium_score
+, potassium_score
+, creatinine_score
+, hematocrit_score
+, wbc_score
+, gcs_score
+, s.tempc
+, s.meanbp
+, s.heartrate
+, s.resprate
+, s.PaO2
+, s.AaDO2
+, s.ph
+, s.hco3
+, s.sodium
+, s.potassium
+, s.creatinine
+, s.hematocrit
+, s.wbc
+, s.gcseyes
+, s.gcsverbal
+, s.gcsmotor
+from icustays ie
+left join score s
+  on ie.icustay_id = s.icustay_id
+order by ie.icustay_id;
