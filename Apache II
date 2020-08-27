@@ -1,0 +1,141 @@
+DROP MATERIALIZED VIEW IF EXISTS APACHEII CASCADE;
+CREATE MATERIALIZED VIEW APACHEII as
+with age_score as
+(
+    select ie.icustay_id
+    , floor( ( cast(ie.intime as date) - cast(pat.dob as date) ) / 365.242 ) as age
+    , case
+        when floor( ( cast(ie.intime as date) - cast(pat.dob as date) ) / 365.242 ) < 45 then 0
+        when floor( ( cast(ie.intime as date) - cast(pat.dob as date) ) / 365.242 ) < 55 then 2
+        when floor( ( cast(ie.intime as date) - cast(pat.dob as date) ) / 365.242 ) < 65 then 3
+        when floor( ( cast(ie.intime as date) - cast(pat.dob as date) ) / 365.242 ) < 75 then 5
+        when floor( ( cast(ie.intime as date) - cast(pat.dob as date) ) / 365.242 ) >= 75 then 6
+    end as age_score
+    from icustays ie
+    left join patients pat
+    on ie.subject_id=pat.subject_id
+    where floor( ( cast(ie.intime as date) - cast(pat.dob as date) ) / 365.242 ) >16
+)
+, surgflag as
+(
+  select ie.icustay_id
+    , max(case
+        when curr_service is null then null
+        when lower(curr_service) like '%surg%' then 1
+        when curr_service = 'ORTHO' then 1
+    else 0 end) as surgical
+  from icustays ie
+  left join services se
+    on ie.hadm_id = se.hadm_id
+    and se.transfertime < ie.intime + interval '1' day
+  group by ie.icustay_id
+)
+, chs as
+(
+select hadm_id
+-- these are slightly different than elixhauser comorbidities, but based on them
+-- they include some non-comorbid ICD-9 codes (e.g. 20302, relapse of multiple myeloma)
+  , max(CASE
+    when icd9_code between '042  ' and '0449 ' then 1
+  		end) as AIDS      /* HIV and AIDS */
+  , max(CASE
+    when icd9_code between '20000' and '20238' then 1 -- lymphoma
+    when icd9_code between '20240' and '20248' then 1 -- leukemia
+    when icd9_code between '20250' and '20302' then 1 -- lymphoma
+    when icd9_code between '20310' and '20312' then 1 -- leukemia
+    when icd9_code between '20302' and '20382' then 1 -- lymphoma
+    when icd9_code between '20400' and '20522' then 1 -- chronic leukemia
+    when icd9_code between '20580' and '20702' then 1 -- other myeloid leukemia
+    when icd9_code between '20720' and '20892' then 1 -- other myeloid leukemia
+    when icd9_code = '2386 ' then 1 -- lymphoma
+    when icd9_code = '2733 ' then 1 -- lymphoma
+  		end) as HEM
+  , max(CASE
+    when icd9_code between '490  ' and '49699' then 1
+  		end) as COPD -- 慢阻肺
+  , max(CASE
+    when icd9_code between '585  ' and '58699' then 1
+  		end) as KD --肾衰
+  , max(CASE
+    when icd9_code like '578%' then 1
+  		end) as GIB --消化道出血
+  , max(CASE
+    when icd9_code between '571  ' and '57299' then 1
+    when icd9_code like '070%' then 1
+  		end) as LD -- 肝硬化
+  , max(CASE
+    when icd9_code between '1960 ' and '1991 ' then 1
+    when icd9_code between '20970' and '20975' then 1
+    when icd9_code = '20979' then 1
+    when icd9_code = '78951' then 1
+  		end) as METS      /* Metastatic cancer */
+  from
+  (
+    select hadm_id, seq_num
+    , cast(icd9_code as char(5)) as icd9_code
+    from diagnoses_icd
+  ) icd
+  group by hadm_id
+)
+, chs_score as
+(
+    select ie.icustay_id
+    , ie.hadm_id
+    , ie.subject_id
+    , chs.AIDS
+    , chs.HEM
+    , chs.METS
+    , chs.GIB
+    , chs.COPD
+    , chs.KD
+    , chs.LD
+    , se.curr_service
+    , sf.surgical
+    , case
+        when adm.ADMISSION_TYPE = 'ELECTIVE' and sf.surgical = 1
+            then 2
+        when adm.ADMISSION_TYPE is null or sf.surgical is null
+            then 0
+      else 5
+      end as chs_score
+
+    from chs
+    left join  icustays ie
+        on ie.hadm_id=chs.hadm_id
+    left join admissions adm
+        on ie.hadm_id = adm.hadm_id
+    left join surgflag sf
+        on ie.icustay_id = sf.icustay_id
+    left join services se
+        on ie.hadm_id=se.hadm_id
+
+    where AIDS is not null or HEM is not null or METS is not null or COPD is not null or KD is not null or LD is not null
+)
+select
+    coalesce(aps.apsii,0)
+    + coalesce(ags.age_score,0)
+    + coalesce(chs.chs_score,0)
+        as APACHEII
+    , aps.*
+    , ags.age
+    , ags.age_score
+    , chs.chs_score
+    , chs.AIDS
+    , chs.HEM
+    , chs.METS
+    , chs.COPD
+    , chs.GIB
+    , chs.KD
+    , chs.LD
+    , chs.curr_service
+    , chs.surgical
+
+from chs_score chs
+left join icustays ie
+  on ie.icustay_id = chs.icustay_id
+left join apsii aps
+  on ie.icustay_id = aps.icustay_id
+left join age_score ags
+  on ie.icustay_id = ags.icustay_id
+where chs.icustay_id is not null
+order by ie.icustay_id;
